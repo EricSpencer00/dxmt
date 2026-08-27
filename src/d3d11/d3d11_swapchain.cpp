@@ -194,6 +194,13 @@ private:
 
   static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     auto *self = reinterpret_cast<PresentationWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    /* This window sits over the whole client area of someone else's window. If
+     * it answers hit tests it takes every click, and with no class cursor the
+     * pointer vanishes over it. It exists to show pixels, nothing else. */
+    if (msg == WM_NCHITTEST)
+      return HTTRANSPARENT;
+    if (msg == WM_MOUSEACTIVATE)
+      return MA_NOACTIVATE;
     if (msg == WM_ERASEBKGND)
       return 1;
     if (msg == WM_PAINT && self) {
@@ -222,6 +229,7 @@ private:
       wc.cbSize = sizeof(wc);
       wc.lpfnWndProc = wndproc;
       wc.hInstance = GetModuleHandleW(nullptr);
+      wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
       wc.lpszClassName = L"DXMTPresentationChild";
       ok = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
     });
@@ -231,9 +239,10 @@ private:
     HWND hwnd = nullptr;
     if (root && GetWindowRect(target, &rect)) {
       MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
-      hwnd = CreateWindowExW(0, L"DXMTPresentationChild", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
-                             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, root,
-                             nullptr, GetModuleHandleW(nullptr), nullptr);
+      hwnd = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"DXMTPresentationChild", L"",
+                             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect.left, rect.top,
+                             rect.right - rect.left, rect.bottom - rect.top, root, nullptr,
+                             GetModuleHandleW(nullptr), nullptr);
     }
     if (hwnd) {
       SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)this);
