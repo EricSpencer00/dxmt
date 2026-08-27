@@ -25,6 +25,8 @@
 #include <atomic>
 #include <cfloat>
 #include <mutex>
+#include <future>
+#include <thread>
 #include <format>
 
 /**
@@ -119,84 +121,141 @@ public:
  * process on exactly the far side of that boundary. Parenting our own child
  * window into the target gives this process a view it does own; drawing into
  * the foreign window directly reports success but never reaches the screen. */
-/* Chromium presents a few frames while its window is still hidden and then
- * stops, because nothing damages it. A real swapchain keeps showing the last
- * frame it was given, so keep one and repaint from it. */
-struct PresentationSurface {
-  std::mutex mutex;
-  std::vector<uint8_t> pixels;
-  UINT width = 0;
-  UINT height = 0;
-
-  void store(const std::vector<uint8_t> &frame, UINT w, UINT h) {
-    std::lock_guard<std::mutex> lock(mutex);
-    pixels = frame;
-    width = w;
-    height = h;
+/* A window owned by another process has no Cocoa view this process can reach,
+ * so there is nothing here to attach a Metal layer to. Chromium puts its GPU
+ * process on exactly the far side of that boundary. Parenting our own child
+ * window into the target gives this process a view it does own; drawing into
+ * the foreign window directly reports success but never reaches the screen.
+ *
+ * The window has to live on a thread that pumps messages. DXMT presents from a
+ * render thread that never will, and a window whose thread does not answer
+ * messages is never composited, however it is drawn into.
+ *
+ * Chromium also presents a few frames while its window is still hidden and then
+ * stops, because nothing damages it. A swapchain keeps showing the frame it was
+ * last given, so keep one and repaint from it. */
+class PresentationWindow {
+public:
+  PresentationWindow(HWND target) {
+    std::promise<HWND> created;
+    auto ready = created.get_future();
+    thread_ = std::thread([this, target, &created] { run(target, created); });
+    hwnd_ = ready.get();
   }
 
-  void blit(HDC hdc) {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (!width || !height || pixels.empty())
+  ~PresentationWindow() {
+    if (hwnd_)
+      PostMessageW(hwnd_, WM_CLOSE, 0, 0);
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+  HWND hwnd() const { return hwnd_; }
+
+  void submit(const std::vector<uint8_t> &frame, UINT width, UINT height) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pixels_ = frame;
+      width_ = width;
+      height_ = height;
+    }
+    if (hwnd_)
+      InvalidateRect(hwnd_, nullptr, FALSE);
+  }
+
+  void follow(HWND target) {
+    if (!hwnd_)
+      return;
+    HWND root = GetAncestor(target, GA_ROOT);
+    RECT rect = {};
+    if (!root || !GetWindowRect(target, &rect))
+      return;
+    MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
+    SetWindowPos(hwnd_, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+  }
+
+private:
+  void paint(HDC hdc) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!width_ || !height_ || pixels_.empty())
       return;
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -(LONG)height;
+    bmi.bmiHeader.biWidth = width_;
+    bmi.bmiHeader.biHeight = -(LONG)height_;
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    StretchDIBits(hdc, 0, 0, width, height, 0, 0, width, height, pixels.data(), &bmi, DIB_RGB_COLORS,
+    StretchDIBits(hdc, 0, 0, width_, height_, 0, 0, width_, height_, pixels_.data(), &bmi, DIB_RGB_COLORS,
                   SRCCOPY);
   }
-};
 
-static LRESULT CALLBACK dxmt_child_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-  auto *surface = reinterpret_cast<PresentationSurface *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-  if (msg == WM_ERASEBKGND)
-    return 1;
-  if (msg == WM_PAINT && surface) {
-    PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
-    surface->blit(hdc);
-    EndPaint(hwnd, &ps);
-    return 0;
+  static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    auto *self = reinterpret_cast<PresentationWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_ERASEBKGND)
+      return 1;
+    if (msg == WM_PAINT && self) {
+      PAINTSTRUCT ps;
+      HDC hdc = BeginPaint(hwnd, &ps);
+      self->paint(hdc);
+      EndPaint(hwnd, &ps);
+      return 0;
+    }
+    if (msg == WM_CLOSE) {
+      DestroyWindow(hwnd);
+      return 0;
+    }
+    if (msg == WM_DESTROY) {
+      PostQuitMessage(0);
+      return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
   }
-  return DefWindowProcW(hwnd, msg, wparam, lparam);
-}
 
-static HWND CreatePresentationChild(HWND target) {
-  static std::once_flag registered;
-  static bool ok = false;
-  std::call_once(registered, [] {
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.lpfnWndProc = dxmt_child_wndproc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"DXMTPresentationChild";
-    ok = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
-  });
-  if (!ok)
-    return nullptr;
+  void run(HWND target, std::promise<HWND> &created) {
+    static std::once_flag registered;
+    static bool ok = false;
+    std::call_once(registered, [] {
+      WNDCLASSEXW wc = {};
+      wc.cbSize = sizeof(wc);
+      wc.lpfnWndProc = wndproc;
+      wc.hInstance = GetModuleHandleW(nullptr);
+      wc.lpszClassName = L"DXMTPresentationChild";
+      ok = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    });
 
-  /* Only a child of the target's top-level window composites; one nested
-   * further down the tree draws nowhere. Chromium's swapchain window is three
-   * levels deep, so place the child on the root and follow the target's rect. */
-  HWND root = GetAncestor(target, GA_ROOT);
-  if (!root)
-    return nullptr;
-  RECT rect = {};
-  if (!GetWindowRect(target, &rect))
-    return nullptr;
-  MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
-  HWND child = CreateWindowExW(
-      0, L"DXMTPresentationChild", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect.left, rect.top,
-      rect.right - rect.left, rect.bottom - rect.top, root, nullptr, GetModuleHandleW(nullptr), nullptr
-  );
-  if (child)
-    SetWindowPos(child, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  return child;
-}
+    HWND root = ok ? GetAncestor(target, GA_ROOT) : nullptr;
+    RECT rect = {};
+    HWND hwnd = nullptr;
+    if (root && GetWindowRect(target, &rect)) {
+      MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
+      hwnd = CreateWindowExW(0, L"DXMTPresentationChild", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                             rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, root,
+                             nullptr, GetModuleHandleW(nullptr), nullptr);
+    }
+    if (hwnd) {
+      SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)this);
+      SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+    created.set_value(hwnd);
+    if (!hwnd)
+      return;
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+
+  std::thread thread_;
+  HWND hwnd_ = nullptr;
+  std::mutex mutex_;
+  std::vector<uint8_t> pixels_;
+  UINT width_ = 0;
+  UINT height_ = 0;
+};
 
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
@@ -218,14 +277,13 @@ public:
       hud(WMT::DeveloperHUDProperties::instance()) {
 
     if (CrossProcess) {
-      present_hwnd_ = CreatePresentationChild(hWnd);
+      presentation_window_ = std::make_unique<PresentationWindow>(hWnd);
+      present_hwnd_ = presentation_window_->hwnd();
       if (!present_hwnd_) {
         ERR("CreateSwapChain: could not parent a presentation child into the target window");
         abort();
       }
       gdi_present_ = true;
-      presentation_surface_ = std::make_unique<PresentationSurface>();
-      SetWindowLongPtrW(present_hwnd_, GWLP_USERDATA, (LONG_PTR)presentation_surface_.get());
       WARN("CreateSwapChain: target window belongs to another process; presenting through an owned child");
     }
 
@@ -310,10 +368,8 @@ public:
     if (native_view_)
       WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
-    if (present_hwnd_ != hWnd) {
-      SetWindowLongPtrW(present_hwnd_, GWLP_USERDATA, 0);
-      DestroyWindow(present_hwnd_);
-    }
+    presentation_window_.reset();
+    present_hwnd_ = hWnd;
     CloseHandle(present_semaphore_);
   };
 
@@ -604,15 +660,8 @@ public:
       backbuffer_desc_.Height = desc_.Height;
     }
 
-    if (present_hwnd_ != hWnd) {
-      RECT rect = {};
-      HWND root = GetAncestor(hWnd, GA_ROOT);
-      if (root && GetWindowRect(hWnd, &rect)) {
-        MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
-        SetWindowPos(present_hwnd_, nullptr, rect.left, rect.top, desc_.Width, desc_.Height,
-                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
-      }
-    }
+    if (presentation_window_)
+      presentation_window_->follow(hWnd);
 
     ApplyLayerProps();
 
@@ -991,24 +1040,7 @@ public:
     }
     context->Unmap(gdi_staging_.ptr(), 0);
 
-    /* The host keeps its own child over this one, so claim the top each frame. */
-    SetWindowPos(present_hwnd_, HWND_TOP, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
-
-    HDC hdc = GetDC(present_hwnd_);
-    if (!hdc)
-      return S_OK;
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = width;
-    bmi.bmiHeader.biHeight = -(LONG)height;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    StretchDIBits(hdc, 0, 0, width, height, 0, 0, width, height, gdi_pixels_.data(), &bmi,
-                  DIB_RGB_COLORS, SRCCOPY);
-    ReleaseDC(present_hwnd_, hdc);
-    presentation_surface_->store(gdi_pixels_, width, height);
+    presentation_window_->submit(gdi_pixels_, width, height);
     presentation_count_++;
     return S_OK;
   }
@@ -1288,7 +1320,7 @@ private:
   std::vector<uint8_t> gdi_pixels_;
   UINT gdi_staging_width_ = 0;
   UINT gdi_staging_height_ = 0;
-  std::unique_ptr<PresentationSurface> presentation_surface_;
+  std::unique_ptr<PresentationWindow> presentation_window_;
 
   std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
