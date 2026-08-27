@@ -1883,7 +1883,18 @@ public:
   void
   STDMETHODCALLTYPE
   SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
-    UNIMPLEMENTED("SwapDeviceContextState");
+    std::lock_guard<mutex_t> lock(mutex);
+
+    if (ppPreviousState)
+      *ppPreviousState = device_context_state_.ref();
+
+    if (!pState)
+      return;
+
+    device_context_state_ = pState;
+
+    ResetEncodingContextState();
+    ResetD3D11ContextState();
   }
 
   void
@@ -5132,6 +5143,7 @@ public:
 
 protected:
   D3D11ContextState state_;
+  Com<ID3DDeviceContextState> device_context_state_;
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;
