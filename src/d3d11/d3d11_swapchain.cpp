@@ -24,6 +24,7 @@
 #include "dxmt_presenter.hpp"
 #include <atomic>
 #include <cfloat>
+#include <mutex>
 #include <format>
 
 /**
@@ -113,13 +114,50 @@ public:
   };
 };
 
+/* A window owned by another process has no Cocoa view this process can reach,
+ * so there is nothing here to attach a Metal layer to. Chromium puts its GPU
+ * process on exactly the far side of that boundary. Parenting our own child
+ * window into the target gives this process a view it does own; drawing into
+ * the foreign window directly reports success but never reaches the screen. */
+static LRESULT CALLBACK dxmt_child_wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+  if (msg == WM_ERASEBKGND)
+    return 1;
+  return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static HWND CreatePresentationChild(HWND parent) {
+  static std::once_flag registered;
+  static bool ok = false;
+  std::call_once(registered, [] {
+    WNDCLASSEXW wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = dxmt_child_wndproc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"DXMTPresentationChild";
+    ok = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+  });
+  if (!ok)
+    return nullptr;
+  RECT client = {};
+  if (!GetClientRect(parent, &client))
+    return nullptr;
+  HWND child = CreateWindowExW(
+      0, L"DXMTPresentationChild", L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0,
+      client.right - client.left, client.bottom - client.top, parent, nullptr,
+      GetModuleHandleW(nullptr), nullptr
+  );
+  if (child)
+    SetWindowPos(child, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+  return child;
+}
+
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
 public:
   MTLD3D11SwapChain(
       IDXGIFactory1 *pFactory, MTLD3D11Device *pDevice, IMTLDXGIDevice *pDXGIDevice,
        HWND hWnd, const DXGI_SWAP_CHAIN_DESC1 *pDesc,
-      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc
+      const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, bool CrossProcess = false
   ) :
       MTLDXGISubObject(pDevice),
       factory_(pFactory),
@@ -128,23 +166,37 @@ public:
       desc_(*pDesc),
       device_context_(pDevice->GetImmediateContextPrivate()),
       hWnd(hWnd),
+      present_hwnd_(hWnd),
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
-    native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
+    if (CrossProcess) {
+      present_hwnd_ = CreatePresentationChild(hWnd);
+      if (!present_hwnd_) {
+        ERR("CreateSwapChain: could not parent a presentation child into the target window");
+        abort();
+      }
+      gdi_present_ = true;
+      WARN("CreateSwapChain: target window belongs to another process; presenting through an owned child");
+    }
 
-    if (!native_view_) {
-      ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
-      abort();
+    if (!gdi_present_) {
+      native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
+
+      if (!native_view_) {
+        ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
+        abort();
+      }
     }
 
     if constexpr (EnableMetalFX) {
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
     }
 
-    presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
-                                 pDevice->GetDXMTDevice().queue().cmd_library,
-                                 scale_factor, desc_.SampleDesc.Count));
+    if (!gdi_present_)
+      presenter = Rc(new Presenter(pDevice->GetMTLDevice(), layer_weak_,
+                                   pDevice->GetDXMTDevice().queue().cmd_library,
+                                   scale_factor, desc_.SampleDesc.Count));
 
     frame_latency = kSwapchainLatency;
     present_semaphore_ = CreateSemaphore(nullptr, frame_latency,
@@ -206,8 +258,11 @@ public:
 
   ~MTLD3D11SwapChain() {
     device_context_->WaitUntilGPUIdle();
-    WMT::ReleaseMetalView(native_view_);
+    if (native_view_)
+      WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+    if (present_hwnd_ != hWnd)
+      DestroyWindow(present_hwnd_);
     CloseHandle(present_semaphore_);
   };
 
@@ -363,7 +418,8 @@ public:
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
     
-    presenter->changeGammaRamp(nullptr);
+    if (presenter)
+      presenter->changeGammaRamp(nullptr);
 
     return S_OK;
   }
@@ -497,6 +553,10 @@ public:
       backbuffer_desc_.Height = desc_.Height;
     }
 
+    if (present_hwnd_ != hWnd)
+      SetWindowPos(present_hwnd_, nullptr, 0, 0, desc_.Width, desc_.Height,
+                   SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+
     ApplyLayerProps();
 
     backbuffer_desc_.Format = desc_.Format;
@@ -574,6 +634,8 @@ public:
   };
 
   void ApplyLayerProps() {
+    if (gdi_present_)
+      return;
     auto target_color_space =
         ConvertColorSpace(desc_.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
@@ -750,6 +812,9 @@ public:
     if (should_exit_fs)
       SetFullscreenState(FALSE, nullptr);
 
+    if (gdi_present_)
+      return hr == DXGI_STATUS_OCCLUDED ? hr : PresentGDI();
+
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
 
     device_context_->PrepareFlush();
@@ -809,6 +874,86 @@ public:
 
     return hr;
   };
+
+  /* winemac.drv only has a Cocoa view for a window whose top level this process
+   * owns, so a Metal layer on this child has nowhere to composite. GDI on a
+   * window this process does own reaches the screen, so read the frame back and
+   * blit it. Slower than a layer, but launcher UIs are not the hot path. */
+  HRESULT PresentGDI() {
+    UINT width = desc_.Width, height = desc_.Height;
+    if (!width || !height)
+      return S_OK;
+
+    Com<ID3D11Device> device;
+    if (FAILED(device_->QueryInterface(IID_PPV_ARGS(&device))))
+      return E_FAIL;
+    Com<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    if (!context)
+      return E_FAIL;
+
+    if (!gdi_staging_ || gdi_staging_width_ != width || gdi_staging_height_ != height) {
+      D3D11_TEXTURE2D_DESC staging_desc = {};
+      staging_desc.Width = width;
+      staging_desc.Height = height;
+      staging_desc.MipLevels = 1;
+      staging_desc.ArraySize = 1;
+      staging_desc.Format = desc_.Format;
+      staging_desc.SampleDesc.Count = 1;
+      staging_desc.Usage = D3D11_USAGE_STAGING;
+      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      gdi_staging_ = nullptr;
+      if (FAILED(device->CreateTexture2D(&staging_desc, nullptr, &gdi_staging_)))
+        return E_FAIL;
+      gdi_staging_width_ = width;
+      gdi_staging_height_ = height;
+      gdi_pixels_.resize((size_t)width * height * 4);
+    }
+
+    context->CopyResource(gdi_staging_.ptr(), backbuffer_.ptr());
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(context->Map(gdi_staging_.ptr(), 0, D3D11_MAP_READ, 0, &mapped)))
+      return E_FAIL;
+
+    bool swap_rb = desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                   desc_.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    for (UINT y = 0; y < height; y++) {
+      const uint8_t *src = (const uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch;
+      uint8_t *dst = gdi_pixels_.data() + (size_t)y * width * 4;
+      if (!swap_rb) {
+        memcpy(dst, src, (size_t)width * 4);
+        continue;
+      }
+      for (UINT x = 0; x < width; x++) {
+        dst[x * 4 + 0] = src[x * 4 + 2];
+        dst[x * 4 + 1] = src[x * 4 + 1];
+        dst[x * 4 + 2] = src[x * 4 + 0];
+        dst[x * 4 + 3] = src[x * 4 + 3];
+      }
+    }
+    context->Unmap(gdi_staging_.ptr(), 0);
+
+    /* The host keeps its own child over this one, so claim the top each frame. */
+    SetWindowPos(present_hwnd_, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_ASYNCWINDOWPOS);
+
+    HDC hdc = GetDC(present_hwnd_);
+    if (!hdc)
+      return S_OK;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -(LONG)height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    StretchDIBits(hdc, 0, 0, width, height, 0, 0, width, height, gdi_pixels_.data(), &bmi,
+                  DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(present_hwnd_, hdc);
+    presentation_count_++;
+    return S_OK;
+  }
 
   void UpdateStatistics(const FrameStatisticsContainer& statistics, uint64_t frame_id) {
     hud.begin();
@@ -1079,6 +1224,12 @@ private:
   dxmt::mutex mutex_;
 
   bool handle_alt_tab_;
+  HWND present_hwnd_;
+  bool gdi_present_ = false;
+  Com<ID3D11Texture2D> gdi_staging_;
+  std::vector<uint8_t> gdi_pixels_;
+  UINT gdi_staging_width_ = 0;
+  UINT gdi_staging_height_ = 0;
 
   std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
@@ -1098,10 +1249,7 @@ CreateSwapChain(
 
   DWORD window_process_id;
   GetWindowThreadProcessId(hWnd, &window_process_id);
-  if (GetProcessId(GetCurrentProcess()) != window_process_id) {
-    ERR("CreateSwapChain: cross-process swapchain not supported yet");
-    return E_FAIL;
-  }
+  bool cross_process = GetProcessId(GetCurrentProcess()) != window_process_id;
 
   Com<IMTLDXGIDevice> layer_factory;
   if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&layer_factory)))) {
@@ -1124,7 +1272,7 @@ CreateSwapChain(
     }
   }
   *ppSwapChain = new MTLD3D11SwapChain<false>(
-      pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc
+      pFactory, pDevice, layer_factory.ptr(), hWnd, pDesc, pFullscreenDesc, cross_process
   );
   return S_OK;
 };
