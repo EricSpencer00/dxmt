@@ -5155,6 +5155,7 @@ public:
       ctx_state(ctx_state),
       mutex(mutex),
       state_(),
+      device_context_state_(Com<ID3DDeviceContextState>::transfer(ref(new MTLD3D11DeviceContextState(pDevice)))),
       annotation_(this),
       ext_(this) {
     pDevice->CreateRasterizerState2(&kDefaultRasterizerDesc, (ID3D11RasterizerState2 **)&default_rasterizer_state);
