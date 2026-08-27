@@ -160,8 +160,15 @@ public:
       width_ = width;
       height_ = height;
     }
-    if (hwnd_)
-      InvalidateRect(hwnd_, nullptr, FALSE);
+    if (!hwnd_)
+      return;
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    static const bool count_frames = getenv("DXMT_PRESENT_COUNT") != nullptr;
+    if (count_frames) {
+      WCHAR text[32];
+      wsprintfW(text, L"frames=%u", ++submitted_);
+      SetWindowTextW(hwnd_, text);
+    }
   }
 
   void follow(HWND target) {
@@ -194,11 +201,6 @@ private:
 
   static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     auto *self = reinterpret_cast<PresentationWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
-    /* This window sits over the whole client area of someone else's window. If
-     * it answers hit tests it takes every click, and with no class cursor the
-     * pointer vanishes over it. It exists to show pixels, nothing else. */
-    if (msg == WM_NCHITTEST)
-      return HTTRANSPARENT;
     if (msg == WM_MOUSEACTIVATE)
       return MA_NOACTIVATE;
     if (msg == WM_ERASEBKGND)
@@ -229,6 +231,11 @@ private:
       wc.cbSize = sizeof(wc);
       wc.lpfnWndProc = wndproc;
       wc.hInstance = GetModuleHandleW(nullptr);
+      /* WS_DISABLED is what keeps this window out of the way. It covers the
+       * whole client area of someone else's window, and only a disabled child
+       * lets clicks and the cursor reach the window underneath. Answering
+       * WM_NCHITTEST with HTTRANSPARENT does not: it routes no input and it
+       * suppresses the class cursor, so the pointer disappears. */
       wc.hCursor = LoadCursorW(nullptr, (LPCWSTR)IDC_ARROW);
       wc.lpszClassName = L"DXMTPresentationChild";
       ok = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
@@ -240,7 +247,7 @@ private:
     if (root && GetWindowRect(target, &rect)) {
       MapWindowPoints(HWND_DESKTOP, root, (POINT *)&rect, 2);
       hwnd = CreateWindowExW(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE, L"DXMTPresentationChild", L"",
-                             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, rect.left, rect.top,
+                             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_DISABLED, rect.left, rect.top,
                              rect.right - rect.left, rect.bottom - rect.top, root, nullptr,
                              GetModuleHandleW(nullptr), nullptr);
     }
@@ -260,6 +267,7 @@ private:
   }
 
   std::thread thread_;
+  unsigned submitted_ = 0;
   HWND hwnd_ = nullptr;
   std::mutex mutex_;
   std::vector<uint8_t> pixels_;
