@@ -70,7 +70,12 @@ public:
 
   /* Direct2D's DC render target renders into the texture and then blits out of
    * this DC, so the texture contents have to be visible to GDI. Metal textures
-   * are not, hence the round trip through a staging copy and a DIB section. */
+   * are not, hence the round trip through a staging copy and a DIB section.
+   * There is no GDI in the native build. */
+#ifndef _WIN32
+  HRESULT STDMETHODCALLTYPE GetDC(BOOL Discard, HDC *phdc) final { return DXGI_ERROR_INVALID_CALL; }
+  HRESULT STDMETHODCALLTYPE ReleaseDC(RECT *pDirtyRect) final { return DXGI_ERROR_INVALID_CALL; }
+#else
   HRESULT STDMETHODCALLTYPE GetDC(BOOL Discard, HDC *phdc) final {
     if (!phdc)
       return E_INVALIDARG;
@@ -145,6 +150,7 @@ public:
     ReleaseDeviceContext();
     return hr;
   }
+#endif
 
 private:
   HRESULT AcquireDeviceContext() {
@@ -221,10 +227,12 @@ private:
   Com<ID3D11Device> device_;
   Com<ID3D11DeviceContext> context_;
   Com<ID3D11Texture2D> staging_;
+#ifdef _WIN32
   HDC hdc_ = nullptr;
   HBITMAP bitmap_ = nullptr;
   HBITMAP old_bitmap_ = nullptr;
   void *bits_ = nullptr;
+#endif
 };
 
 } // namespace dxmt

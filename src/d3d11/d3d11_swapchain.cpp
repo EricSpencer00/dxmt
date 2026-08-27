@@ -116,6 +116,7 @@ public:
   };
 };
 
+#ifdef _WIN32
 /* A window owned by another process has no Cocoa view this process can reach,
  * so there is nothing here to attach a Metal layer to. Chromium puts its GPU
  * process on exactly the far side of that boundary. Parenting our own child
@@ -257,6 +258,8 @@ private:
   UINT height_ = 0;
 };
 
+#endif
+
 template <bool EnableMetalFX>
 class MTLD3D11SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D11Device> {
 public:
@@ -276,6 +279,7 @@ public:
       monitor_(wsi::getWindowMonitor(hWnd)),
       hud(WMT::DeveloperHUDProperties::instance()) {
 
+#ifdef _WIN32
     if (CrossProcess) {
       presentation_window_ = std::make_unique<PresentationWindow>(hWnd);
       present_hwnd_ = presentation_window_->hwnd();
@@ -286,6 +290,7 @@ public:
       gdi_present_ = true;
       WARN("CreateSwapChain: target window belongs to another process; presenting through an owned child");
     }
+#endif
 
     if (!gdi_present_) {
       native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
@@ -368,7 +373,9 @@ public:
     if (native_view_)
       WMT::ReleaseMetalView(native_view_);
     native_view_ = {};
+#ifdef _WIN32
     presentation_window_.reset();
+#endif
     present_hwnd_ = hWnd;
     CloseHandle(present_semaphore_);
   };
@@ -660,8 +667,10 @@ public:
       backbuffer_desc_.Height = desc_.Height;
     }
 
+#ifdef _WIN32
     if (presentation_window_)
       presentation_window_->follow(hWnd);
+#endif
 
     ApplyLayerProps();
 
@@ -1040,7 +1049,9 @@ public:
     }
     context->Unmap(gdi_staging_.ptr(), 0);
 
+#ifdef _WIN32
     presentation_window_->submit(gdi_pixels_, width, height);
+#endif
     presentation_count_++;
     return S_OK;
   }
@@ -1320,7 +1331,9 @@ private:
   std::vector<uint8_t> gdi_pixels_;
   UINT gdi_staging_width_ = 0;
   UINT gdi_staging_height_ = 0;
+#ifdef _WIN32
   std::unique_ptr<PresentationWindow> presentation_window_;
+#endif
 
   std::conditional<EnableMetalFX, Rc<SpatialScaler>, std::monostate>::type metalfx_scaler;
   std::conditional<EnableMetalFX, Com<D3D11ResourceCommon>, std::monostate>::type upscaled_backbuffer_;
